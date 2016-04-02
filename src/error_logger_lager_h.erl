@@ -1,4 +1,4 @@
-%% Copyright (c) 2011-2012 Basho Technologies, Inc.  All Rights Reserved.
+%% Copyright (c) 2011-2015 Basho Technologies, Inc.  All Rights Reserved.
 %%
 %% This file is provided to you under the Apache License,
 %% Version 2.0 (the "License"); you may not use this file
@@ -31,31 +31,28 @@
 -export([init/1, handle_call/2, handle_event/2, handle_info/2, terminate/2,
         code_change/3]).
 
--export([format_reason/1]).
+-export([format_reason/1, format_mfa/1, format_args/3]).
 
--record(state, {
-        %% how many messages per second we try to deliver
-        hwm = undefined :: 'undefined' | pos_integer(),
-        %% how many messages we've received this second
-        mps = 0 :: non_neg_integer(),
-        %% the current second
-        lasttime = os:timestamp() :: erlang:timestamp(),
-        %% count of dropped messages this second
-        dropped = 0 :: non_neg_integer()
+-record(state, { 
+        sink :: atom(),
+        shaper :: lager_shaper(),
+        %% group leader strategy
+        groupleader_strategy :: handle | ignore | mirror,
+        raw :: boolean()
     }).
 
--define(LOGMSG(Level, Pid, Msg),
-    case ?SHOULD_LOG(Level) of
+-define(LOGMSG(Sink, Level, Pid, Msg),
+    case ?SHOULD_LOG(Sink, Level) of
         true ->
-            _ =lager:log(Level, Pid, Msg),
+            _ =lager:log(Sink, Level, Pid, Msg, []),
             ok;
         _ -> ok
     end).
 
--define(LOGFMT(Level, Pid, Fmt, Args),
-    case ?SHOULD_LOG(Level) of
+-define(LOGFMT(Sink, Level, Pid, Fmt, Args),
+    case ?SHOULD_LOG(Sink, Level) of
         true ->
-            _ = lager:log(Level, Pid, Fmt, Args),
+            _ = lager:log(Sink, Level, Pid, Fmt, Args),
             ok;
         _ -> ok
     end).
@@ -74,20 +71,29 @@ set_high_water(N) ->
     gen_event:call(error_logger, ?MODULE, {set_high_water, N}, infinity).
 
 -spec init(any()) -> {ok, #state{}}.
-init([HighWaterMark]) ->
-    {ok, #state{hwm=HighWaterMark}}.
+init([HighWaterMark, GlStrategy]) ->
+    Shaper = #lager_shaper{hwm=HighWaterMark},
+    Raw = lager_app:get_env(lager, error_logger_format_raw, false),
+    Sink = configured_sink(),
+    {ok, #state{sink=Sink, shaper=Shaper, groupleader_strategy=GlStrategy, raw=Raw}}.
 
-handle_call({set_high_water, N}, State) ->
-    {ok, ok, State#state{hwm = N}};
+handle_call({set_high_water, N}, #state{shaper=Shaper} = State) ->
+    NewShaper = Shaper#lager_shaper{hwm=N},
+    {ok, ok, State#state{shaper = NewShaper}};
 handle_call(_Request, State) ->
     {ok, unknown_call, State}.
 
-handle_event(Event, State) ->
-    case check_hwm(State) of
-        {true, NewState} ->
-            log_event(Event, NewState);
-        {false, NewState} ->
-            {ok, NewState}
+handle_event(Event, #state{sink=Sink, shaper=Shaper} = State) ->
+    case lager_util:check_hwm(Shaper) of
+        {true, 0, NewShaper} ->
+            eval_gl(Event, State#state{shaper=NewShaper});
+        {true, Drop, #lager_shaper{hwm=Hwm} = NewShaper} when Drop > 0 ->
+            ?LOGFMT(Sink, warning, self(), 
+                "lager_error_logger_h dropped ~p messages in the last second that exceeded the limit of ~p messages/sec", 
+                [Drop, Hwm]),
+            eval_gl(Event, State#state{shaper=NewShaper});
+        {false, _, NewShaper} ->
+            {ok, State#state{shaper=NewShaper}}
     end.
 
 handle_info(_Info, State) ->
@@ -96,94 +102,96 @@ handle_info(_Info, State) ->
 terminate(_Reason, _State) ->
     ok.
 
+
+code_change(_OldVsn, {state, Shaper, GLStrategy}, _Extra) ->
+    Raw = lager_app:get_env(lager, error_logger_format_raw, false),
+    {ok, #state{
+        sink=configured_sink(), 
+        shaper=Shaper, 
+        groupleader_strategy=GLStrategy, 
+        raw=Raw
+        }};
+code_change(_OldVsn, {state, Sink, Shaper, GLS}, _Extra) ->
+    Raw = lager_app:get_env(lager, error_logger_format_raw, false),
+    {ok, #state{sink=Sink, shaper=Shaper, groupleader_strategy=GLS, raw=Raw}};
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 %% internal functions
 
-check_hwm(State = #state{hwm = undefined}) ->
-    {true, State};
-check_hwm(State = #state{mps = Mps, hwm = Hwm}) when Mps < Hwm ->
-    %% haven't hit high water mark yet, just log it
-    {true, State#state{mps=Mps+1}};
-check_hwm(State = #state{hwm = Hwm, lasttime = Last, dropped = Drop}) ->
-    %% are we still in the same second?
-    {M, S, _} = Now = os:timestamp(),
-    case Last of
-        {M, S, _} ->
-            %% still in same second, but have exceeded the high water mark
-            NewDrops = discard_messages(Now, 0),
-            {false, State#state{dropped=Drop+NewDrops}};
-        _ ->
-            %% different second, reset all counters and allow it
-            case Drop > 0 of
-                true ->
-                    ?LOGFMT(warning, self(), "lager_error_logger_h dropped ~p messages in the last second that exceeded the limit of ~p messages/sec",
-                        [Drop, Hwm]);
-                false ->
-                    ok
-            end,
-            {true, State#state{dropped = 0, mps=1, lasttime = Now}}
+configured_sink() ->
+    case proplists:get_value(?ERROR_LOGGER_SINK, lager_app:get_env(lager, extra_sinks, [])) of
+        undefined -> ?DEFAULT_SINK;
+        _ -> ?ERROR_LOGGER_SINK
     end.
 
-discard_messages(Second, Count) ->
-    {M, S, _} = os:timestamp(),
-    case Second of
-        {M, S, _} ->
-            receive
-                %% we only discard gen_event notifications, because
-                %% otherwise we might discard gen_event internal
-                %% messages, such as trapped EXITs
-                {notify, _Event} ->
-                    discard_messages(Second, Count+1);
-                {_From, _Tag, {sync_notify, _Event}} ->
-                    discard_messages(Second, Count+1)
-            after 0 ->
-                    Count
-            end;
-        _ ->
-            Count
-    end.
+eval_gl(Event, #state{groupleader_strategy=GlStrategy0}=State) when is_pid(element(2, Event)) ->
+    case element(2, Event) of
+         GL when node(GL) =/= node(), GlStrategy0 =:= ignore ->
+            gen_event:notify({error_logger, node(GL)}, Event),
+            {ok, State};
+         GL when node(GL) =/= node(), GlStrategy0 =:= mirror ->
+            gen_event:notify({error_logger, node(GL)}, Event),
+            log_event(Event, State);
+         _ ->
+            log_event(Event, State)
+    end;
+eval_gl(Event, State) ->
+    log_event(Event, State).
 
-log_event(Event, State) ->
+log_event(Event, #state{sink=Sink} = State) ->
     case Event of
         {error, _GL, {Pid, Fmt, Args}} ->
-            case Fmt of
-                "** Generic server "++_ ->
+            FormatRaw = State#state.raw,
+            case {FormatRaw, Fmt} of
+                {false, "** Generic server "++_} ->
                     %% gen_server terminate
                     [Name, _Msg, _State, Reason] = Args,
                     ?CRASH_LOG(Event),
-                    ?LOGFMT(error, Pid, "gen_server ~w terminated with reason: ~s",
+                    ?LOGFMT(Sink, error, Pid, "gen_server ~w terminated with reason: ~s",
                         [Name, format_reason(Reason)]);
-                "** State machine "++_ ->
+                {false, "** State machine "++_} ->
                     %% gen_fsm terminate
                     [Name, _Msg, StateName, _StateData, Reason] = Args,
                     ?CRASH_LOG(Event),
-                    ?LOGFMT(error, Pid, "gen_fsm ~w in state ~w terminated with reason: ~s",
+                    ?LOGFMT(Sink, error, Pid, "gen_fsm ~w in state ~w terminated with reason: ~s",
                         [Name, StateName, format_reason(Reason)]);
-                "** gen_event handler"++_ ->
+                {false, "** gen_event handler"++_} ->
                     %% gen_event handler terminate
                     [ID, Name, _Msg, _State, Reason] = Args,
                     ?CRASH_LOG(Event),
-                    ?LOGFMT(error, Pid, "gen_event ~w installed in ~w terminated with reason: ~s",
+                    ?LOGFMT(Sink, error, Pid, "gen_event ~w installed in ~w terminated with reason: ~s",
                         [ID, Name, format_reason(Reason)]);
-                "** Cowboy handler"++_ ->
+                {false, "** Cowboy handler"++_} ->
                     %% Cowboy HTTP server error
                     ?CRASH_LOG(Event),
                     case Args of
                         [Module, Function, Arity, _Request, _State] ->
                             %% we only get the 5-element list when its a non-exported function
-                            ?LOGFMT(error, Pid,
+                            ?LOGFMT(Sink, error, Pid,
                                 "Cowboy handler ~p terminated with reason: call to undefined function ~p:~p/~p",
                                 [Module, Module, Function, Arity]);
                         [Module, Function, Arity, _Class, Reason | Tail] ->
                             %% any other cowboy error_format list *always* ends with the stacktrace
                             StackTrace = lists:last(Tail),
-                            ?LOGFMT(error, Pid,
+                            ?LOGFMT(Sink, error, Pid,
                                 "Cowboy handler ~p terminated in ~p:~p/~p with reason: ~s",
                                 [Module, Module, Function, Arity, format_reason({Reason, StackTrace})])
                     end;
-                "webmachine error"++_ ->
+                {false, "Ranch listener "++_} ->
+                    %% Ranch errors
+                    ?CRASH_LOG(Event),
+                    case Args of
+                        [Ref, _Protocol, Worker, {[{reason, Reason}, {mfa, {Module, Function, Arity}}, {stacktrace, StackTrace} | _], _}] ->
+                            ?LOGFMT(Sink, error, Worker,
+                                "Ranch listener ~p terminated in ~p:~p/~p with reason: ~s",
+                                [Ref, Module, Function, Arity, format_reason({Reason, StackTrace})]);
+                        [Ref, _Protocol, Worker, Reason] ->
+                            ?LOGFMT(Sink, error, Worker,
+                                "Ranch listener ~p terminated with reason: ~s",
+                                [Ref, format_reason(Reason)])
+                    end;
+                {false, "webmachine error"++_} ->
                     %% Webmachine HTTP server error
                     ?CRASH_LOG(Event),
                     [Path, Error] = Args,
@@ -194,34 +202,34 @@ log_event(Event, State) ->
                         _ ->
                             Error
                     end,
-                    ?LOGFMT(error, Pid, "Webmachine error at path ~p : ~s", [Path, format_reason(StackTrace)]);
+                    ?LOGFMT(Sink, error, Pid, "Webmachine error at path ~p : ~s", [Path, format_reason(StackTrace)]);
                 _ ->
                     ?CRASH_LOG(Event),
-                    ?LOGMSG(error, Pid, lager:safe_format(Fmt, Args, ?DEFAULT_TRUNCATION))
+                    ?LOGFMT(Sink, error, Pid, Fmt, Args)
             end;
         {error_report, _GL, {Pid, std_error, D}} ->
             ?CRASH_LOG(Event),
-            ?LOGMSG(error, Pid, print_silly_list(D));
+            ?LOGMSG(Sink, error, Pid, print_silly_list(D));
         {error_report, _GL, {Pid, supervisor_report, D}} ->
             ?CRASH_LOG(Event),
             case lists:sort(D) of
                 [{errorContext, Ctx}, {offender, Off}, {reason, Reason}, {supervisor, Name}] ->
                     Offender = format_offender(Off),
-                    ?LOGFMT(error, Pid,
+                    ?LOGFMT(Sink, error, Pid,
                         "Supervisor ~w had child ~s exit with reason ~s in context ~w",
                         [supervisor_name(Name), Offender, format_reason(Reason), Ctx]);
                 _ ->
-                    ?LOGMSG(error, Pid, "SUPERVISOR REPORT " ++ print_silly_list(D))
+                    ?LOGMSG(Sink, error, Pid, "SUPERVISOR REPORT " ++ print_silly_list(D))
             end;
         {error_report, _GL, {Pid, crash_report, [Self, Neighbours]}} ->
             ?CRASH_LOG(Event),
-            ?LOGMSG(error, Pid, "CRASH REPORT " ++ format_crash_report(Self, Neighbours));
+            ?LOGMSG(Sink, error, Pid, "CRASH REPORT " ++ format_crash_report(Self, Neighbours));
         {warning_msg, _GL, {Pid, Fmt, Args}} ->
-            ?LOGMSG(warning, Pid, lager:safe_format(Fmt, Args, ?DEFAULT_TRUNCATION));
+            ?LOGFMT(Sink, warning, Pid, Fmt, Args);
         {warning_report, _GL, {Pid, std_warning, Report}} ->
-            ?LOGMSG(warning, Pid, print_silly_list(Report));
+            ?LOGMSG(Sink, warning, Pid, print_silly_list(Report));
         {info_msg, _GL, {Pid, Fmt, Args}} ->
-            ?LOGMSG(info, Pid, lager:safe_format(Fmt, Args, ?DEFAULT_TRUNCATION));
+            ?LOGFMT(Sink, info, Pid, Fmt, Args);
         {info_report, _GL, {Pid, std_info, D}} when is_list(D) ->
             Details = lists:sort(D),
             case Details of
@@ -230,14 +238,14 @@ log_event(Event, State) ->
                         {ok, true} when Reason == stopped ->
                             ok;
                         _ ->
-                            ?LOGFMT(info, Pid, "Application ~w exited with reason: ~s",
+                            ?LOGFMT(Sink, info, Pid, "Application ~w exited with reason: ~s",
                                     [App, format_reason(Reason)])
                     end;
                 _ ->
-                    ?LOGMSG(info, Pid, print_silly_list(D))
+                    ?LOGMSG(Sink, info, Pid, print_silly_list(D))
             end;
         {info_report, _GL, {Pid, std_info, D}} ->
-            ?LOGFMT(info, Pid, "~w", [D]);
+            ?LOGFMT(Sink, info, Pid, "~w", [D]);
         {info_report, _GL, {P, progress, D}} ->
             Details = lists:sort(D),
             case Details of
@@ -246,19 +254,19 @@ log_event(Event, State) ->
                         {ok, true} ->
                             ok;
                         _ ->
-                            ?LOGFMT(info, P, "Application ~w started on node ~w",
+                            ?LOGFMT(Sink, info, P, "Application ~w started on node ~w",
                                     [App, Node])
                     end;
                 [{started, Started}, {supervisor, Name}] ->
                     MFA = format_mfa(get_value(mfargs, Started)),
                     Pid = get_value(pid, Started),
-                    ?LOGFMT(debug, P, "Supervisor ~w started ~s at pid ~w",
+                    ?LOGFMT(Sink, debug, P, "Supervisor ~w started ~s at pid ~w",
                         [supervisor_name(Name), MFA, Pid]);
                 _ ->
-                    ?LOGMSG(info, P, "PROGRESS REPORT " ++ print_silly_list(D))
+                    ?LOGMSG(Sink, info, P, "PROGRESS REPORT " ++ print_silly_list(D))
             end;
         _ ->
-            ?LOGFMT(warning, self(), "Unexpected error_logger event ~w", [Event])
+            ?LOGFMT(Sink, warning, self(), "Unexpected error_logger event ~w", [Event])
     end,
     {ok, State}.
 
@@ -287,7 +295,15 @@ format_offender(Off) ->
         MFArgs ->
             %% regular supervisor
             MFA = format_mfa(MFArgs),
-            Name = get_value(name, Off),
+
+            %% In 2014 the error report changed from `name' to
+            %% `id', so try that first.
+            Name = case get_value(id, Off) of
+                       undefined ->
+                           get_value(name, Off);
+                       Id ->
+                           Id
+                   end,
             io_lib:format("~p started with ~s at ~w",
                 [Name, MFA, get_value(pid, Off)])
     end.
@@ -318,7 +334,7 @@ format_reason({function_clause, [MFA|_]}) ->
 format_reason({if_clause, [MFA|_]}) ->
     ["no true branch found while evaluating if expression in ", format_mfa(MFA)];
 format_reason({{try_clause, Val}, [MFA|_]}) ->
-    ["no try clause matching ", print_val(Val), " in ", format_mfa(MFA)]; 
+    ["no try clause matching ", print_val(Val), " in ", format_mfa(MFA)];
 format_reason({badarith, [MFA|_]}) ->
     ["bad arithmetic expression in ", format_mfa(MFA)];
 format_reason({{badmatch, Val}, [MFA|_]}) ->
